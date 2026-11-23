@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org" lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Edit todo</title>
+</head>
+<body>
+<h1>Edit todo</h1>
+<form th:action="@{/todos/{id}(id=${todo.id})}" th:object="${form}" method="post">
+    <input type="text" th:field="*{title}" maxlength="200" autofocus>
+    <button type="submit">Save</button>
+    <a th:href="@{/todos}">Cancel</a>
+    <p class="error" th:if="${#fields.hasErrors('title')}" th:errors="*{title}">Title error</p>
+</form>
+</body>
+</html>
