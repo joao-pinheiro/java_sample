@@ -38,7 +38,9 @@ The Host allowlist protects your browser against DNS rebinding; it is **not acce
 
 Do not add, change or remove any `server.tomcat.remoteip.*` or `server.request.header.forwarded.*` property. The two already in `application.properties` (`server.request.header.forwarded.strategy=none` and the deliberately empty `server.tomcat.remoteip.host-header=`) are required security settings, and any other value lets `X-Forwarded-Host` bypass the allowlist.
 
-`SERVER_ADDRESS` and `ALLOWED_HOSTS` (comma-separated hostnames without port; an empty value rejects every request) exist for development only.
+`SERVER_ADDRESS` (default `127.0.0.1`) exists for development only.
+
+`ALLOWED_HOSTS` (comma-separated hostnames without port; an empty value rejects every request) exists for development only.
 
 ## Testcontainers
 
