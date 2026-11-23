@@ -30,7 +30,7 @@ The repository is empty; the owner wants a todo list web application built on
 Java with Spring Boot 4, PostgreSQL as the only database, Thymeleaf
 server-side templates, and Testcontainers wherever a test needs a database.
 Agreed scope: **single user, no login**. A todo has a title, a done flag and
-a creation time. Users can add, rename, toggle done/undone, delete, filter
+a creation time. Users can add, rename, mark done/undone, delete, filter
 (all / active / completed) and clear all completed todos. Spring Boot 4
 reorganised many starters and test-annotation packages compared to Boot 3, so
 everything Boot-4-specific in this plan (artifact names, import paths,
@@ -41,7 +41,13 @@ CSRF protection is in scope even without login: every state change is an HTML
 form POST, and without CSRF tokens any website the user visits could submit
 those forms to the app (for example, wipe the list via
 `/todos/clear-completed`). Spring Security is added with CSRF on and all
-requests permitted.
+requests permitted. Because there is no login, CSRF tokens alone are not
+enough: a hostile page can use **DNS rebinding** (its domain re-resolving to
+`127.0.0.1`) to read the app's pages same-origin, pick up a valid token, and
+forge requests. Two further controls close this: the app **only answers
+requests whose `Host` header is on an allowlist** (default `localhost`,
+`127.0.0.1`; Spring Security's `StrictHttpFirewall`), and it **listens on
+`127.0.0.1` only** by default, so nobody else on the network can reach it.
 
 ## Current state
 
@@ -71,13 +77,43 @@ requests permitted.
     - `org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc`
   - `@ServiceConnection` (from `org.springframework.boot.testcontainers.service.connection`)
     wires the container's JDBC URL/user/password into the app — no
-    `@DynamicPropertySource` needed.
+    `@DynamicPropertySource` needed. Docker publishes the container's port on
+    all network interfaces, and the Testcontainers default password is public
+    knowledge, so the container gets a random password (`withPassword(UUID...)`);
+    `@ServiceConnection` picks it up.
+  - A `StrictHttpFirewall` bean replaces Spring Security's default firewall
+    (which accepts any `Host`); requests with a host not on the allowlist are
+    rejected with HTTP 400 before reaching any controller — measured, including under MockMvc.
+  - The firewall checks the *server name* Tomcat derived from the request.
+    Whenever Tomcat's `RemoteIpValve` is installed, it takes that name from
+    `X-Forwarded-Host` for requests from a "trusted internal proxy" — by
+    default loopback **and** all private ranges (10/8, 172.16/12, 192.168/16, …).
+    A DNS-rebinding page on the same machine can set that header. The valve is
+    installed when forwarded headers are on (explicitly, or automatically when
+    Boot detects a cloud platform) **or** when any `server.tomcat.remoteip.*`
+    header property is set. Two pins in `application.properties` close this:
+    - `server.tomcat.remoteip.host-header=` (empty) — even if the valve is
+      installed, it never takes the host from a header. This is the load-bearing pin.
+    - `server.request.header.forwarded.strategy=none` — Boot never installs
+      forwarded-header handling on its own (defense in depth). Valid values in
+      Boot 4.2 are `web-server`, `framework`, `none` (`native` is rejected at
+      startup; `server.forward-headers-strategy` is the deprecated old name).
+  - Measured on 2026-11-23 (`Host: evil.example` + `X-Forwarded-Host: localhost`):
+    | Configuration | Result |
+    |---|---|
+    | both pins, plain dev run | 400 |
+    | both pins, `SPRING_MAIN_CLOUD_PLATFORM=kubernetes` + `SERVER_TOMCAT_REMOTEIP_PROTOCOLHEADER=X-Forwarded-Proto` | 400 |
+    | strategy pin only, `SERVER_TOMCAT_REMOTEIP_PROTOCOLHEADER=X-Forwarded-Proto` | **200 (bypass)** |
+    | no pins, `SPRING_MAIN_CLOUD_PLATFORM=kubernetes` | **200 (bypass)** |
+    | host-header pin only, `SPRING_MAIN_CLOUD_PLATFORM=kubernetes` | 400 |
+    | both pins, operator sets `SERVER_REQUEST_HEADER_FORWARDED_STRATEGY=framework` | **200** — explicit operator override; documented as forbidden |
   - Spring Security auto-creates an in-memory user and logs
     `Using generated security password: ...` unless
     `org.springframework.boot.security.autoconfigure.UserDetailsServiceAutoConfiguration`
     is excluded. The app has no users, so it is excluded.
-  - Thymeleaf inserts the hidden `_csrf` input automatically into every form
-    whose action is written as `th:action="@{...}"` (not a plain `action="..."`).
+  - Thymeleaf inserts the hidden `_csrf` input automatically into every **POST**
+    form whose action is written as `th:action="@{...}"` (not a plain
+    `action="..."`). GET forms deliberately get no token.
     `thymeleaf-extras-springsecurity6` is **not** needed for this.
 - Conventions to follow (there is no existing code; these are the conventions
   Spring Initializr generates — keep them): tabs for indentation in Java,
@@ -96,10 +132,14 @@ requests permitted.
 | Title rules | trimmed; 1–200 chars after trimming; enforced by Bean Validation in the form **and** by the DB (`VARCHAR(200)` + `CHECK`) |
 | Ordering | creation time ascending, then id |
 | Unknown id | `TodoNotFoundException` annotated `@ResponseStatus(NOT_FOUND)` → HTTP 404 with `templates/error/404.html` |
+| Missing/expired CSRF token (e.g. session expired, server restarted while a page was open) | HTTP 403 with `templates/error/403.html` ("Page expired ... reload") instead of Boot's whitelabel page |
+| Done/undone | The form posts the **target** state (`completed=true\|false`), not "toggle": a double-click or a stale second tab cannot flip a todo the wrong way |
 | Bad `filter` value | Spring's enum conversion fails → HTTP 400 (default behaviour, tested) |
 | HTTP shape | Only GET and POST (HTML forms cannot send PUT/DELETE; no hidden-method filter). Post/Redirect/Get after every successful POST; on validation errors the page is re-rendered with HTTP 200 and field errors |
 | Filter preserved | Every list-page POST carries `?filter=` and redirects back to `/todos?filter=<FILTER>` |
-| Security | Spring Security, CSRF on, `anyRequest().permitAll()`, no login, no users |
+| Security | Spring Security, CSRF on, `anyRequest().permitAll()`, no login, no users; `StrictHttpFirewall` with a `Host` allowlist from property `todo.allowed-hosts` (env `ALLOWED_HOSTS`, default `localhost,127.0.0.1`); forwarded-host handling pinned off (`server.tomcat.remoteip.host-header=` and `server.request.header.forwarded.strategy=none`) so `X-Forwarded-Host` cannot bypass the allowlist |
+| Network binding | `server.address` from env `SERVER_ADDRESS`, default `127.0.0.1` |
+| Session cookie | renamed `TODO_SESSION` to avoid accidental collision with other apps on `localhost:<other port>` that use the default `JSESSIONID` (cookies are not port-scoped; a page on another localhost port can still overwrite it deliberately — the effect is a 403 "page expired", not a bypass) |
 | Open-session-in-view | disabled (`spring.jpa.open-in-view=false`) — all entity access happens inside `TodoService` transactions |
 
 Endpoints:
@@ -109,7 +149,7 @@ Endpoints:
 | GET | `/` | redirect to `/todos` |
 | GET | `/todos?filter=ALL\|ACTIVE\|COMPLETED` | list page (default `ALL`) |
 | POST | `/todos?filter=...` | create from form field `title` |
-| POST | `/todos/{id}/toggle?filter=...` | flip done flag |
+| POST | `/todos/{id}/completed?filter=...` | set done flag to form field `completed` (`true`/`false`) |
 | POST | `/todos/{id}/delete?filter=...` | delete |
 | POST | `/todos/clear-completed?filter=...` | delete all completed |
 | GET | `/todos/{id}/edit` | edit page |
@@ -120,9 +160,9 @@ Endpoints:
 | Purpose | Command | Expected on success |
 |---|---|---|
 | Compile incl. tests | `./mvnw -q -B test-compile` | exit 0, no output |
-| One test class | `./mvnw -B test -Dtest=TodoWebTests \| grep -E 'Tests run: [0-9]+, Fail.*Skipped: [0-9]+$\|BUILD'` | `Tests run: 15, Failures: 0, Errors: 0, Skipped: 0` and `BUILD SUCCESS` |
+| One test class | `./mvnw -B test -Dtest=TodoWebTests \| grep -E 'Tests run: [0-9]+, Fail.*Skipped: [0-9]+$\|BUILD'` | `Tests run: 18, Failures: 0, Errors: 0, Skipped: 0` and `BUILD SUCCESS` |
 | One test method | `./mvnw -B test -Dtest='TodoWebTests#titleIsHtmlEscaped'` | `Tests run: 1, Failures: 0, Errors: 0` |
-| Full suite | `./mvnw -B verify` | `Tests run: 19, Failures: 0, Errors: 0, Skipped: 0` and `BUILD SUCCESS` |
+| Full suite | `./mvnw -B verify` | `Tests run: 22, Failures: 0, Errors: 0, Skipped: 0` and `BUILD SUCCESS` |
 | Run app for development (throwaway Postgres in Docker via Testcontainers) | `./mvnw spring-boot:test-run` | log line `Tomcat started on port 8080` — use the exact recipe in Step 5.2 when running it as a check |
 
 The first `./mvnw` run downloads Maven and all dependencies, and the first test
@@ -154,7 +194,7 @@ something in this plan does not resolve:
 - Created by you:
   - `src/main/resources/db/migration/V1__create_todo.sql`
   - `src/main/java/com/example/todo/{Todo,TodoRepository,TodoFilter,TodoNotFoundException,TodoService,TodoForm,TodoController,SecurityConfig}.java`
-  - `src/main/resources/templates/todos/list.html`, `src/main/resources/templates/todos/edit.html`, `src/main/resources/templates/error/404.html`
+  - `src/main/resources/templates/todos/list.html`, `src/main/resources/templates/todos/edit.html`, `src/main/resources/templates/error/404.html`, `src/main/resources/templates/error/403.html`
   - `src/test/java/com/example/todo/TodoRepositoryTests.java`, `src/test/java/com/example/todo/TodoWebTests.java`
   - `README.md`
 - `plans/README.md` — status row only.
@@ -186,8 +226,10 @@ Run each and compare:
 
 - `java -version 2>&1 | head -1` → contains `"25.` (Java 25). If it shows any other major version, STOP — do **not** lower `javaVersion` / `<java.version>`.
 - `docker info --format '{{.ServerVersion}}'` → prints a version, exit 0. Otherwise STOP.
+- `docker pull -q postgres:18-alpine` → prints `docker.io/library/postgres:18-alpine`, exit 0. Otherwise STOP (no registry access; Testcontainers will also need to pull `testcontainers/ryuk`).
 - `git rev-parse --is-inside-work-tree` → `true`. Otherwise STOP (the operator must `git init` and commit `plans/` first).
 - `git config user.name && git config user.email` → both print a value. Otherwise STOP and ask the operator; do not invent an identity.
+- `command -v ss` → prints a path (e.g. `/usr/bin/ss`). Otherwise STOP — Step 5.2 needs it.
 - `curl -s -o /dev/null localhost:8080; echo $?` → `7` (nothing listening on port 8080). If it prints `0`, something already uses the port: STOP before Step 5.2 and report it.
 - Branch: if you were dispatched into a dedicated worktree/branch (e.g. by `coding:execute-plan`), stay on it. Otherwise run `git checkout -b advisor/001-todo-app`.
 
@@ -223,8 +265,9 @@ the four lines regardless of leading whitespace:
 ```
 
 **Edit 2** — overwrite `src/test/java/com/example/todo/TestcontainersConfiguration.java`
-with the content below. (The generated file differs only in using
-`postgres:latest`; pinning the image is the point of this edit.) If the
+with the content below. (The generated file uses `postgres:latest` and the
+Testcontainers default password; this version pins the image and sets a random
+password, because Docker publishes the container port on all interfaces.) If the
 generated file imports any container class other than
 `org.testcontainers.postgresql.PostgreSQLContainer`, STOP and report — the
 Testcontainers version is not the one this plan was verified against.
@@ -232,6 +275,7 @@ Testcontainers version is not the one this plan was verified against.
 ```java
 package com.example.todo;
 
+import java.util.UUID;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.context.annotation.Bean;
@@ -244,7 +288,8 @@ class TestcontainersConfiguration {
 	@Bean
 	@ServiceConnection
 	PostgreSQLContainer postgresContainer() {
-		return new PostgreSQLContainer(DockerImageName.parse("postgres:18-alpine"));
+		return new PostgreSQLContainer(DockerImageName.parse("postgres:18-alpine"))
+			.withPassword(UUID.randomUUID().toString());
 	}
 
 }
@@ -297,12 +342,20 @@ spring.datasource.password=${DB_PASSWORD:}
 spring.jpa.hibernate.ddl-auto=validate
 spring.jpa.open-in-view=false
 spring.autoconfigure.exclude=org.springframework.boot.security.autoconfigure.UserDetailsServiceAutoConfiguration
+server.address=${SERVER_ADDRESS:127.0.0.1}
+server.servlet.session.cookie.name=TODO_SESSION
+todo.allowed-hosts=${ALLOWED_HOSTS:localhost,127.0.0.1}
+server.request.header.forwarded.strategy=none
+server.tomcat.remoteip.host-header=
 ```
 
-`DB_URL`, `DB_USERNAME`, `DB_PASSWORD` are read from the environment at run
-time. Never commit a real password; the empty default is intentional. Tests do
-not use these values — `@ServiceConnection` overrides the datasource with the
-container's.
+`DB_URL`, `DB_USERNAME`, `DB_PASSWORD`, `SERVER_ADDRESS`, `ALLOWED_HOSTS`
+are read from the environment at run time. Never commit a real password; the
+empty default is intentional. Tests do not use the `DB_*` values —
+`@ServiceConnection` overrides the datasource with the container's.
+`server.address`, the session cookie name, `todo.allowed-hosts` and the
+forwarded-headers pin are explained in "Current state" and its Design table.
+Keep `server.request.header.forwarded.strategy=none` and `server.tomcat.remoteip.host-header=` (with nothing after `=`) exactly as written.
 
 Create `src/main/resources/db/migration/V1__create_todo.sql`:
 
@@ -358,7 +411,7 @@ public class Todo {
 	public boolean isCompleted() { return completed; }
 	public Instant getCreatedAt() { return createdAt; }
 	public void setTitle(String title) { this.title = title; }
-	public void toggle() { this.completed = !this.completed; }
+	public void setCompleted(boolean completed) { this.completed = completed; }
 }
 ```
 
@@ -420,7 +473,7 @@ class TodoRepositoryTests {
 		Todo a = repository.save(new Todo("a"));
 		Todo b = repository.save(new Todo("b"));
 		Todo c = repository.save(new Todo("c"));
-		b.toggle();
+		b.setCompleted(true);
 		repository.flush();
 
 		assertThat(repository.findAllByOrderByCreatedAtAscIdAsc()).extracting(Todo::getTitle).containsExactly("a", "b", "c");
@@ -432,7 +485,7 @@ class TodoRepositoryTests {
 	@Test
 	void deleteCompletedRemovesOnlyCompleted() {
 		repository.save(new Todo("keep"));
-		repository.save(new Todo("drop")).toggle();
+		repository.save(new Todo("drop")).setCompleted(true);
 		repository.flush();
 
 		assertThat(repository.deleteCompleted()).isEqualTo(1);
@@ -483,8 +536,8 @@ public class TodoNotFoundException extends RuntimeException {
 ```
 
 `src/main/java/com/example/todo/TodoService.java` — all mutations go through
-here, inside a transaction; `rename`/`toggle` rely on JPA dirty checking (no
-explicit `save`), which only works because the class is `@Transactional`:
+here, inside a transaction; `rename`/`setCompleted` rely on JPA dirty checking
+(no explicit `save`), which only works because the class is `@Transactional`:
 
 ```java
 package com.example.todo;
@@ -530,8 +583,8 @@ public class TodoService {
 		get(id).setTitle(title.strip());
 	}
 
-	public void toggle(long id) {
-		get(id).toggle();
+	public void setCompleted(long id, boolean completed) {
+		get(id).setCompleted(completed);
 	}
 
 	public void delete(long id) {
@@ -603,9 +656,10 @@ public class TodoController {
 		return redirectTo(filter);
 	}
 
-	@PostMapping("/todos/{id}/toggle")
-	String toggle(@PathVariable long id, @RequestParam(defaultValue = "ALL") TodoFilter filter) {
-		service.toggle(id);
+	@PostMapping("/todos/{id}/completed")
+	String setCompleted(@PathVariable long id, @RequestParam boolean completed,
+			@RequestParam(defaultValue = "ALL") TodoFilter filter) {
+		service.setCompleted(id, completed);
 		return redirectTo(filter);
 	}
 
@@ -653,15 +707,20 @@ public class TodoController {
 ```
 
 `src/main/java/com/example/todo/SecurityConfig.java` — CSRF is on by default in
-Spring Security; do **not** call `.csrf(...)` at all:
+Spring Security; do **not** call `.csrf(...)` at all. The `HttpFirewall` bean is
+picked up by Spring Security automatically and enforces the `Host` allowlist:
 
 ```java
 package com.example.todo;
 
+import java.util.List;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.firewall.HttpFirewall;
+import org.springframework.security.web.firewall.StrictHttpFirewall;
 
 @Configuration(proxyBeanMethods = false)
 class SecurityConfig {
@@ -671,6 +730,13 @@ class SecurityConfig {
 		return http
 			.authorizeHttpRequests(auth -> auth.anyRequest().permitAll())
 			.build();
+	}
+
+	@Bean
+	HttpFirewall httpFirewall(@Value("${todo.allowed-hosts}") List<String> allowedHosts) {
+		StrictHttpFirewall firewall = new StrictHttpFirewall();
+		firewall.setAllowedHostnames(allowedHosts::contains);
+		return firewall;
 	}
 }
 ```
@@ -697,7 +763,8 @@ is rendered with `th:text` (escaped), **never** `th:utext`:
 
 <ul id="todo-list">
     <li th:each="todo : ${todos}" th:classappend="${todo.completed} ? 'completed'">
-        <form th:action="@{/todos/{id}/toggle(id=${todo.id},filter=${filter})}" method="post" style="display:inline">
+        <form th:action="@{/todos/{id}/completed(id=${todo.id},filter=${filter})}" method="post" style="display:inline">
+            <input type="hidden" name="completed" th:value="${!todo.completed}">
             <button type="submit" th:text="${todo.completed} ? 'Undo' : 'Done'">Done</button>
         </form>
         <span class="title" th:text="${todo.title}">Title</span>
@@ -760,6 +827,23 @@ is rendered with `th:text` (escaped), **never** `th:utext`:
 </html>
 ```
 
+`src/main/resources/templates/error/403.html`:
+
+```html
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org" lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Page expired</title>
+</head>
+<body>
+<h1>Page expired</h1>
+<p>This page expired. Your change was not saved. Reload the list and try again.</p>
+<a th:href="@{/todos}">Back to the list</a>
+</body>
+</html>
+```
+
 `src/test/java/com/example/todo/TodoWebTests.java` — full stack: MockMvc → controller → service →
 real PostgreSQL. Every POST needs `.with(csrf())` except the one test that
 proves a POST without it is rejected:
@@ -786,6 +870,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.context.annotation.Import;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -810,9 +895,9 @@ class TodoWebTests {
 
 	@Test
 	void createThenListShowsTodo() throws Exception {
-		mvc.perform(post("/todos").param("title", "  Buy milk  ").with(csrf()))
+		mvc.perform(post("/todos").param("title", "  Buy milk  ").param("filter", "ACTIVE").with(csrf()))
 			.andExpect(status().is3xxRedirection())
-			.andExpect(redirectedUrl("/todos?filter=ALL"));
+			.andExpect(redirectedUrl("/todos?filter=ACTIVE"));
 
 		assertThat(repository.findAll()).extracting(Todo::getTitle).containsExactly("Buy milk");
 		mvc.perform(get("/todos"))
@@ -840,20 +925,46 @@ class TodoWebTests {
 	}
 
 	@Test
-	void toggleMarksCompletedAndBack() throws Exception {
+	void completedSetsTheRequestedStateIdempotently() throws Exception {
 		Todo todo = repository.save(new Todo("t"));
-		mvc.perform(post("/todos/{id}/toggle", todo.getId()).param("filter", "ACTIVE").with(csrf()))
-			.andExpect(redirectedUrl("/todos?filter=ACTIVE"));
-		assertThat(repository.findById(todo.getId()).orElseThrow().isCompleted()).isTrue();
-		mvc.perform(post("/todos/{id}/toggle", todo.getId()).with(csrf()));
+		for (int i = 0; i < 2; i++) {
+			mvc.perform(post("/todos/{id}/completed", todo.getId()).param("completed", "true").param("filter", "ACTIVE").with(csrf()))
+				.andExpect(redirectedUrl("/todos?filter=ACTIVE"));
+			assertThat(repository.findById(todo.getId()).orElseThrow().isCompleted()).isTrue();
+		}
+		mvc.perform(post("/todos/{id}/completed", todo.getId()).param("completed", "false").with(csrf()));
 		assertThat(repository.findById(todo.getId()).orElseThrow().isCompleted()).isFalse();
+	}
+
+	@Test
+	void completedFormOffersTheOppositeState() throws Exception {
+		Todo todo = repository.save(new Todo("t"));
+		mvc.perform(get("/todos"))
+			.andExpect(content().string(containsString("name=\"completed\" value=\"true\"")))
+			.andExpect(content().string(not(containsString("name=\"completed\" value=\"false\""))));
+		todo.setCompleted(true);
+		repository.save(todo);
+		mvc.perform(get("/todos"))
+			.andExpect(content().string(containsString("name=\"completed\" value=\"false\"")))
+			.andExpect(content().string(not(containsString("name=\"completed\" value=\"true\""))));
+	}
+
+	@Test
+	void listFormsPreserveTheCurrentFilter() throws Exception {
+		Todo todo = repository.save(new Todo("t"));
+		long id = todo.getId();
+		mvc.perform(get("/todos").param("filter", "ACTIVE"))
+			.andExpect(content().string(containsString("action=\"/todos?filter=ACTIVE\"")))
+			.andExpect(content().string(containsString("action=\"/todos/" + id + "/completed?filter=ACTIVE\"")))
+			.andExpect(content().string(containsString("action=\"/todos/" + id + "/delete?filter=ACTIVE\"")))
+			.andExpect(content().string(containsString("action=\"/todos/clear-completed?filter=ACTIVE\"")));
 	}
 
 	@Test
 	void filterShowsOnlyMatchingTodos() throws Exception {
 		repository.save(new Todo("open-item"));
 		Todo done = repository.save(new Todo("done-item"));
-		mvc.perform(post("/todos/{id}/toggle", done.getId()).with(csrf()));
+		mvc.perform(post("/todos/{id}/completed", done.getId()).param("completed", "true").with(csrf()));
 
 		mvc.perform(get("/todos").param("filter", "ACTIVE"))
 			.andExpect(content().string(containsString("1 item(s) left")))
@@ -877,9 +988,9 @@ class TodoWebTests {
 	void clearCompletedKeepsActive() throws Exception {
 		repository.save(new Todo("keep"));
 		Todo done = repository.save(new Todo("drop"));
-		mvc.perform(post("/todos/{id}/toggle", done.getId()).with(csrf()));
+		mvc.perform(post("/todos/{id}/completed", done.getId()).param("completed", "true").with(csrf()));
 
-		mvc.perform(post("/todos/clear-completed").with(csrf())).andExpect(redirectedUrl("/todos?filter=ALL"));
+		mvc.perform(post("/todos/clear-completed").param("filter", "COMPLETED").with(csrf())).andExpect(redirectedUrl("/todos?filter=COMPLETED"));
 		assertThat(repository.findAll()).extracting(Todo::getTitle).containsExactly("keep");
 	}
 
@@ -907,13 +1018,15 @@ class TodoWebTests {
 	@Test
 	void unknownIdReturns404() throws Exception {
 		mvc.perform(get("/todos/{id}/edit", 999999)).andExpect(status().isNotFound());
-		mvc.perform(post("/todos/{id}/toggle", 999999).with(csrf())).andExpect(status().isNotFound());
+		mvc.perform(post("/todos/{id}/completed", 999999).param("completed", "true").with(csrf())).andExpect(status().isNotFound());
 		mvc.perform(post("/todos/{id}/delete", 999999).with(csrf())).andExpect(status().isNotFound());
 	}
 
 	@Test
 	void invalidFilterReturns400() throws Exception {
-		mvc.perform(get("/todos").param("filter", "BOGUS")).andExpect(status().isBadRequest());
+		mvc.perform(get("/todos").param("filter", "BOGUS"))
+			.andExpect(status().isBadRequest())
+			.andExpect(result -> assertThat(result.getResolvedException()).isInstanceOf(MethodArgumentTypeMismatchException.class));
 	}
 
 	@Test
@@ -930,8 +1043,22 @@ class TodoWebTests {
 	}
 
 	private static void assertEveryFormHasCsrfToken(String html, int expectedForms) {
-		assertThat(html.split("<form", -1).length - 1).isEqualTo(expectedForms);
-		assertThat(html.split("name=\"_csrf\"", -1).length - 1).isEqualTo(expectedForms);
+		String[] parts = html.split("(?i)<form", -1);
+		assertThat(parts.length - 1).isEqualTo(expectedForms);
+		for (int i = 1; i < parts.length; i++) {
+			String form = parts[i].substring(0, parts[i].toLowerCase().indexOf("</form>"));
+			assertThat(form).contains("method=\"post\"").contains("type=\"hidden\" name=\"_csrf\"");
+		}
+	}
+
+	@Test
+	void requestWithForeignHostHeaderIsRejected() throws Exception {
+		for (String host : new String[] { "evil.example", "localhostx", "ost", "127.0.0.2", "evillocalhost", "127x0x0x1" }) {
+			mvc.perform(get("/todos").header("Host", host)).andExpect(status().isBadRequest());
+		}
+		for (String host : new String[] { "localhost:8080", "127.0.0.1", "127.0.0.1:8080" }) {
+			mvc.perform(get("/todos").header("Host", host)).andExpect(status().isOk());
+		}
 	}
 
 	@Test
@@ -945,7 +1072,7 @@ class TodoWebTests {
 ```
 
 **Verify**:
-- `./mvnw -B test -Dtest=TodoWebTests | grep -E 'Tests run: [0-9]+, Fail.*Skipped: [0-9]+$|BUILD'` → `Tests run: 15, Failures: 0, Errors: 0, Skipped: 0` and `BUILD SUCCESS`
+- `./mvnw -B test -Dtest=TodoWebTests | grep -E 'Tests run: [0-9]+, Fail.*Skipped: [0-9]+$|BUILD'` → `Tests run: 18, Failures: 0, Errors: 0, Skipped: 0` and `BUILD SUCCESS`
 - `grep -rn 'th:utext' src/main/resources/templates` → no output
 - `grep -c '<form' src/main/resources/templates/todos/list.html` and `grep -c '<form th:action=' src/main/resources/templates/todos/list.html` → both print `4`
 - `grep -rn 'csrf' src/main/java` → no output (CSRF must not be configured, i.e. not disabled)
@@ -960,15 +1087,18 @@ Create `README.md` with these sections (prose is yours, the commands must be exa
 - **Run tests**: `./mvnw verify`
 - **Run locally with a throwaway database**: `./mvnw spring-boot:test-run`, then open http://localhost:8080 (data is lost when the app stops).
 - **Run against your own PostgreSQL**: set `DB_URL` (default `jdbc:postgresql://localhost:5432/todo`), `DB_USERNAME` (default `todo`), `DB_PASSWORD`, then `./mvnw spring-boot:run`. Flyway creates the schema on startup.
-- **Security note**: no login; CSRF protection is on; do not expose the app beyond a trusted network without adding authentication.
+- **Your own PostgreSQL — requirements**: the database and the `DB_USERNAME` role must already exist (Flyway does not create them); use a dedicated, **empty** database owned by `DB_USERNAME` (PostgreSQL 15+ no longer lets non-owners create tables in `public`; Flyway refuses a non-empty schema that has no Flyway history table). Do not "fix" that with `spring.flyway.baseline-on-migrate=true`: with the default baseline version `1` it skips `V1` and startup then fails schema validation.
+- **Package**: `./mvnw package` (runs the tests, so Docker is needed; add `-DskipTests` to skip them), then `java -jar target/todo-0.0.1-SNAPSHOT.jar` with the same `DB_*` variables. Requires a Java 25 runtime.
+- **Network and security**: this is a **local, single-user app with no login**. It listens on `127.0.0.1` only (open http://127.0.0.1:8080 if `localhost` resolves only to `::1` on your machine) and answers only requests whose `Host` is `localhost` or `127.0.0.1`; CSRF protection is on. The Host allowlist protects your browser against DNS rebinding; it is **not access control** — any program that can connect can send `Host: localhost`. Running it anywhere else — on another machine, on `0.0.0.0`, behind a reverse proxy — is **unsupported**: anyone who can reach it can read and change the list. That needs authentication first, which this app does not have. Do not set any `server.tomcat.remoteip.*` or `server.request.header.forwarded.*` property: they let `X-Forwarded-Host` bypass the allowlist. `SERVER_ADDRESS` and `ALLOWED_HOSTS` (comma-separated hostnames without port; an empty value rejects every request) exist for development only.
+- **Testcontainers**: needs a Docker-compatible daemon found via `DOCKER_HOST` or the default socket; Docker CLI contexts are not read. For Podman, point `DOCKER_HOST` at the Podman socket. Docker publishes container ports on all network interfaces, including the PostgreSQL and Testcontainers' Ryuk containers during `spring-boot:test-run`; on an untrusted network set `"ip": "127.0.0.1"` in Docker's `daemon.json`.
 
-**Verify**: `grep -c -e './mvnw verify' -e './mvnw spring-boot:test-run' -e 'DB_URL' README.md` → `3` or more.
+**Verify**: `grep -c -e './mvnw verify' -e './mvnw spring-boot:test-run' -e 'DB_URL' -e 'ALLOWED_HOSTS' -e 'SERVER_ADDRESS' -e 'DOCKER_HOST' -e 'DskipTests' README.md` → `7` or more.
 
 Commit.
 
 ### Step 5: Full verification, dev run, falsifiability bar
 
-1. `./mvnw -B verify | grep -E 'Tests run: [0-9]+, Fail.*Skipped: [0-9]+$|BUILD'` → `Tests run: 19, Failures: 0, Errors: 0, Skipped: 0` and `BUILD SUCCESS`.
+1. `./mvnw -B verify | grep -E 'Tests run: [0-9]+, Fail.*Skipped: [0-9]+$|BUILD'` → `Tests run: 22, Failures: 0, Errors: 0, Skipped: 0` and `BUILD SUCCESS`.
 2. Dev-run smoke test. Run this script from the repository root as one `bash`
    invocation (the log and cookie jar go to temp files **outside** the repo, so
    nothing is left behind). It was run on the scratch build; expected output
@@ -976,28 +1106,40 @@ Commit.
 
    ```bash
    LOG=$(mktemp) JAR=$(mktemp)
-   ./mvnw -q spring-boot:test-run > "$LOG" 2>&1 &
+   SPRING_MAIN_CLOUD_PLATFORM=kubernetes SERVER_TOMCAT_REMOTEIP_PROTOCOLHEADER=X-Forwarded-Proto ./mvnw -q spring-boot:test-run > "$LOG" 2>&1 &
    PID=$!
    for i in $(seq 1 180); do grep -q 'Tomcat started on port 8080' "$LOG" && break; sleep 1; done
    grep -c 'Tomcat started on port 8080' "$LOG"
+   ss -ltnH 'sport = :8080' | awk '{print $4}' | grep -cxE '(\[::ffff:)?127\.0\.0\.1\]?:8080'
    curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' localhost:8080/
    TOKEN=$(curl -s -c "$JAR" localhost:8080/todos | grep -o 'name="_csrf" value="[^"]*"' | head -1 | sed 's/.*value="\([^"]*\)"/\1/')
    curl -s -b "$JAR" -o /dev/null -w '%{http_code} %{redirect_url}\n' -d "_csrf=$TOKEN" -d 'title=smoke-test' 'localhost:8080/todos?filter=ALL'
    curl -s -b "$JAR" localhost:8080/todos | grep -c 'smoke-test'
-   curl -s -b "$JAR" -o /dev/null -w '%{http_code}\n' -d 'title=forged' 'localhost:8080/todos'
+   curl -s -o /dev/null -w '%{http_code}\n' -d 'title=forged' 'localhost:8080/todos'
+   curl -s -H 'Accept: text/html' -d 'title=forged' 'localhost:8080/todos' | grep -c '<h1>Page expired</h1>'
    curl -s -H 'Accept: text/html' localhost:8080/todos/999999/edit | grep -c 'That todo does not exist'
+   curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: evil.example' localhost:8080/todos
+   curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: evil.example' -H 'X-Forwarded-Host: localhost' localhost:8080/todos
+   curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: 127.0.0.1:8080' localhost:8080/todos
    kill $PID; wait $PID 2>/dev/null; sleep 2
    curl -s -o /dev/null localhost:8080 || echo stopped
    rm -f "$LOG" "$JAR"
    ```
 
-   Expected output, line by line: `1`, `302 http://localhost:8080/todos`,
-   `302 http://localhost:8080/todos?filter=ALL`, `1`, `403`, `1`, `stopped`.
+   Expected output, line by line: `1`, `1`, `302 http://localhost:8080/todos`,
+   `302 http://localhost:8080/todos?filter=ALL`, `1`, `403`, `1`, `1`, `400`, `400`, `200`, `stopped`.
+   (The second `1` is the loopback-binding check: `ss` showed the listener as
+   `[::ffff:127.0.0.1]:8080` on the planning machine; it must not be `0.0.0.0`, `*` or `[::]`.
+   The two environment variables on the launch line deliberately create the
+   two conditions under which Tomcat would trust `X-Forwarded-Host` — a
+   detected cloud platform and a `server.tomcat.remoteip.*` setting — so the
+   tenth line (`400`) proves the pins hold, not merely that nothing enabled
+   forwarded headers. Measured on the scratch build: exactly the expected output.)
    (First run may take minutes while Docker pulls the image; the loop waits up
    to 180 s. If the first line is `0`, read the log before it is deleted —
    remove the `rm` line and rerun.) Do **not** stop the app with
    `pkill -f spring-boot:test-run`: that pattern can match and kill your own shell.
-   The `Accept: text/html` header matters: without it Boot answers 404s with JSON instead of `error/404.html`.
+   The `Accept: text/html` header matters: without it Boot answers errors with JSON instead of `error/404.html` / `error/403.html`.
 3. Run every row of the falsifiability bar below.
 
 ## Test plan & coverage
@@ -1012,33 +1154,38 @@ the repository or service**. Two layers:
 - **Application context** (`TodoApplicationTests#contextLoads`, generated) — Flyway migration applies and Hibernate `validate` accepts the mapping.
 - **Web layer, full stack** (`TodoWebTests`, `@SpringBootTest` + MockMvc + container; `@BeforeEach` empties the table because these tests do not roll back):
   - `rootRedirectsToList`
-  - `createThenListShowsTodo` — title trimmed, PRG redirect keeps the filter, list renders it, active counter.
+  - `createThenListShowsTodo` — title trimmed, PRG redirect keeps a non-default filter (`ACTIVE`), list renders it, active counter.
   - `blankTitleIsRejectedAndNothingSaved` — HTTP 200, field error, zero rows.
   - `titleLongerThan200IsRejected` — HTTP 200, field error, zero rows.
-  - `toggleMarksCompletedAndBack` — flips both ways; redirect preserves `filter=ACTIVE`.
+  - `completedSetsTheRequestedStateIdempotently` — posting `completed=true` twice leaves it completed (no flip-back); `completed=false` reopens it; redirect preserves `filter=ACTIVE`.
+  - `completedFormOffersTheOppositeState` — an open todo's form carries `completed=true` and no `false`; once completed, the reverse.
   - `filterShowsOnlyMatchingTodos` — ACTIVE and COMPLETED views exclude the other kind; the active counter reads `1 item(s) left` with one open and one completed todo.
   - `deleteRemovesTodo` — with two todos, only the targeted one is removed; redirect preserves `filter=COMPLETED`.
-  - `clearCompletedKeepsActive`
+  - `clearCompletedKeepsActive` — redirect keeps `filter=COMPLETED`.
   - `editRenamesTodo` — edit form is pre-filled; rename persists, trimmed (`"  new  "` → `new`).
   - `editWithBlankTitleKeepsOldTitle`
-  - `unknownIdReturns404` — edit, toggle and delete on a missing id.
-  - `invalidFilterReturns400`
+  - `unknownIdReturns404` — edit, set-completed and delete on a missing id.
+  - `invalidFilterReturns400` — HTTP 400 caused specifically by `MethodArgumentTypeMismatchException` (enum conversion), not any 400.
   - `postWithoutCsrfTokenIsRejected` — HTTP 403 and nothing saved.
-  - `everyFormCarriesCsrfToken` — number of `_csrf` inputs equals number of `<form>` tags on the list page (4 with one todo) and the edit page (1).
+  - `everyFormCarriesCsrfToken` — the list page (one todo) has exactly 4 forms and the edit page 1 (`<form` matched case-insensitively), and **each** form, up to its `</form>`, contains `method="post"` and its own hidden `_csrf` input.
+  - `requestWithForeignHostHeaderIsRejected` — `evil.example`, `localhostx`, `ost`, `127.0.0.2`, `evillocalhost`, `127x0x0x1` → 400 (rules out substring, prefix, suffix, regex and deny-list implementations); `localhost:8080`, `127.0.0.1`, `127.0.0.1:8080` → 200 (rules out an implementation that ignores the property's second entry).
+  - `listFormsPreserveTheCurrentFilter` — on `?filter=ACTIVE`, the add, done/undone, delete and clear-completed form actions all carry `?filter=ACTIVE`.
   - `titleIsHtmlEscaped` — `<script>` in a title is rendered escaped.
 
 Coverage bar: every controller endpoint, every `TodoService` method (including the trim in both `create` and `rename`), both outcomes of each validation
 branch (valid → redirect, invalid → re-render), the not-found branch of
-`TodoService.get`, each `TodoFilter` arm, and both CSRF properties (requests
-without a token are refused; every rendered form has one).
+`TodoService.get`, each `TodoFilter` arm, both CSRF properties (requests
+without a token are refused; every rendered POST form has one), and the `Host` allowlist.
 
 Deliberately not covered:
-- Concurrency (two tabs editing the same todo): last write wins, acceptable for a single-user app.
+- Concurrent renames from two tabs: the later rename wins, acceptable for a single-user app. (Done/undone is safe across tabs because the form posts the target state.)
+- Whether `todo.allowed-hosts` is actually read (vs. a hard-coded `localhost,127.0.0.1`): row 19 shows the property's second entry is honoured, but no test sets a custom value; a hard-coded set would fail closed (400 for any added host), not open.
+- `invalidFilterReturns400` has no falsifiability row: the 400 comes from Spring's own enum conversion; there is no line of this app's code to remove that would not also change the parameter type. Its assertion on the exception type is what keeps it honest.
 - Visual layout / browser behaviour (no Selenium/Playwright): templates are asserted through rendered HTML only.
-- `TestTodoApplication` / `spring-boot:test-run` and the rendered `error/404.html` page — checked by the Step 5.2 smoke script, not by a test (MockMvc does not perform the error-page dispatch).
-- Running against a non-container PostgreSQL (`DB_URL` path) — configuration only; Flyway behaviour is the same.
+- `TestTodoApplication` / `spring-boot:test-run`, the rendered `error/404.html` and `error/403.html` pages, and the `127.0.0.1` binding — checked by the Step 5.2 smoke script / configuration, not by a test (MockMvc does not perform the error-page dispatch).
+- Running against a user-provided PostgreSQL — its requirements are documented in the README (Step 4), not tested.
 
-**Verification**: `./mvnw -B verify` → `Tests run: 19, Failures: 0, Errors: 0, Skipped: 0`.
+**Verification**: `./mvnw -B verify` → `Tests run: 22, Failures: 0, Errors: 0, Skipped: 0`.
 
 ### Falsifiability bar
 
@@ -1054,38 +1201,46 @@ failure" column is what was observed there.
 | 2 | `TodoController.java`, `create` method: remove `@Valid` before `@ModelAttribute("form")` | `-Dtest='TodoWebTests#blankTitleIsRejectedAndNothingSaved'` | error: `DataIntegrityViolationException ... violates check constraint "todo_title_check"` (the request reached the DB instead of being rejected by validation) |
 | 3 | `TodoForm.java`: delete ` @Size(max = 200)` | `-Dtest='TodoWebTests#titleLongerThan200IsRejected'` | error: `DataIntegrityViolationException ... value too long for type character varying(200)` |
 | 4 | `TodoService.java`: `new Todo(title.strip())` → `new Todo(title)` | `-Dtest='TodoWebTests#createThenListShowsTodo'` | assertion failure at the `containsExactly("Buy milk")` line |
-| 5 | `Todo.java`: `this.completed = !this.completed;` → `this.completed = true;` | `-Dtest='TodoWebTests#toggleMarksCompletedAndBack'` | assertion failure (expected `false` after the second toggle) |
+| 5 | `Todo.java`: `public void setCompleted(boolean completed) { this.completed = completed; }` → `public void setCompleted(boolean completed) { this.completed = !this.completed; }` (the old toggle behaviour) | `-Dtest='TodoWebTests#completedSetsTheRequestedStateIdempotently'` | assertion failure (second `completed=true` flips it back) |
 | 6 | `TodoService.java`: `case ACTIVE -> repository.findByCompletedOrderByCreatedAtAscIdAsc(false);` → `case ACTIVE -> repository.findAllByOrderByCreatedAtAscIdAsc();` | `-Dtest='TodoWebTests#filterShowsOnlyMatchingTodos'` | assertion failure `Response content` |
 | 7 | `TodoRepository.java`: `delete from Todo t where t.completed = true` → `delete from Todo t` | `-Dtest='TodoWebTests#clearCompletedKeepsActive'`, then `-Dtest='TodoRepositoryTests#deleteCompletedRemovesOnlyCompleted'` | assertion failure in each |
 | 8 | `TodoNotFoundException.java`: delete the `@ResponseStatus(HttpStatus.NOT_FOUND)` line (leave the now-unused imports — it still compiles) | `-Dtest='TodoWebTests#unknownIdReturns404'` | error: `Request processing failed: com.example.todo.TodoNotFoundException: Todo 999999 not found` |
 | 9 | `V1__create_todo.sql`: delete ` CHECK (length(trim(title)) > 0)` | `-Dtest='TodoRepositoryTests#databaseRejectsBlankTitle'` | assertion failure (no exception thrown) |
-| 10 | `TodoController.java`, `redirectTo`: `return "redirect:/todos?filter=" + filter.name();` → `return "redirect:/todos";` | `-Dtest='TodoWebTests#toggleMarksCompletedAndBack'` | `Redirected URL expected:</todos?filter=ACTIVE> but was:</todos>` |
+| 10 | `TodoController.java`, `redirectTo`: `return "redirect:/todos?filter=" + filter.name();` → `return "redirect:/todos";` | `-Dtest='TodoWebTests#completedSetsTheRequestedStateIdempotently'` | `Redirected URL expected:</todos?filter=ACTIVE> but was:</todos>` |
 | 11 | `SecurityConfig.java`: append `.csrf(csrf -> csrf.disable())` after `.authorizeHttpRequests(auth -> auth.anyRequest().permitAll())` | `-Dtest='TodoWebTests#postWithoutCsrfTokenIsRejected'` | `Status expected:<403> but was:<302>` |
 | 12 | `templates/todos/list.html`: `<form th:action="@{/todos/clear-completed(filter=${filter})}" method="post">` → `<form action="/todos/clear-completed" method="post">` | `-Dtest='TodoWebTests#everyFormCarriesCsrfToken'` | assertion failure in `assertEveryFormHasCsrfToken` |
 | 13 | `TodoService.java`: `return repository.countByCompleted(false);` → `return repository.count();` | `-Dtest='TodoWebTests#filterShowsOnlyMatchingTodos'` | assertion failure `Response content` |
 | 14 | `TodoService.java`: `get(id).setTitle(title.strip());` → `get(id).setTitle(title);` | `-Dtest='TodoWebTests#editRenamesTodo'` | assertion failure (title is `"  new  "`) |
 | 15 | `TodoService.java`: `repository.delete(get(id));` → `get(id); repository.deleteAll();` | `-Dtest='TodoWebTests#deleteRemovesTodo'` | assertion failure at `containsExactly(keep.getId())` |
-| 16 | `TodoService.java`: delete the class-level `@Transactional` line (the one directly above `public class TodoService`, at column 0; leave the indented method-level ones) | `-Dtest='TodoWebTests#toggleMarksCompletedAndBack'`, then `-Dtest='TodoWebTests#editRenamesTodo'` | assertion failure in each (changes to the detached entity are never flushed) |
+| 16 | `TodoService.java`: delete the class-level `@Transactional` line (the one directly above `public class TodoService`, at column 0; leave the indented method-level ones) | `-Dtest='TodoWebTests#completedSetsTheRequestedStateIdempotently'`, then `-Dtest='TodoWebTests#editRenamesTodo'` | assertion failure in each (changes to the detached entity are never flushed) |
+| 17 | `templates/todos/list.html`: `th:value="${!todo.completed}"` → `th:value="${todo.completed}"` | `-Dtest='TodoWebTests#completedFormOffersTheOppositeState'` | assertion failure `Response content` |
+| 18 | `SecurityConfig.java`: delete the line `firewall.setAllowedHostnames(allowedHosts::contains);` (still compiles; the parameter becomes unused) | `-Dtest='TodoWebTests#requestWithForeignHostHeaderIsRejected'` | `Status expected:<400> but was:<200>` |
+| 19 | `SecurityConfig.java`: `firewall.setAllowedHostnames(allowedHosts::contains);` → `firewall.setAllowedHostnames("localhost"::equals);` (ignores the property) | `-Dtest='TodoWebTests#requestWithForeignHostHeaderIsRejected'` | `Status expected:<200> but was:<400>` |
+| 20 | `templates/todos/list.html`: `th:action="@{/todos/{id}/completed(id=${todo.id},filter=${filter})}"` → `th:action="@{/todos/{id}/completed(id=${todo.id})}"` | `-Dtest='TodoWebTests#listFormsPreserveTheCurrentFilter'` | assertion failure `Response content` |
+| 21 | `SecurityConfig.java`: `firewall.setAllowedHostnames(allowedHosts::contains);` → `firewall.setAllowedHostnames(h -> allowedHosts.stream().anyMatch(h::endsWith));` (suffix matching) | `-Dtest='TodoWebTests#requestWithForeignHostHeaderIsRejected'` | `Status expected:<400> but was:<200>` |
+| 22 | `application.properties`: delete the line `server.tomcat.remoteip.host-header=` | the Step 5.2 smoke script (not a unit test) | its tenth line prints `200` instead of `400` |
 
 Prefix every test command with `./mvnw -B test` and pipe through `grep -E '^\[ERROR\]   |Tests run:'`.
 If a row does **not** fail, that is a finding — report it; do not adjust the test to make it fail.
+
+The `server.request.header.forwarded.strategy=none` pin has **no row of its own**, on purpose: the host-header pin shadows it (measured: with only the host-header pin, the spoof is still rejected), so deleting it alone changes nothing observable. It is defense in depth. Row 22 proves the load-bearing pin.
 
 ## Code review
 
 **Executor: self-review before you report.** State the outcome of each in your report:
 
-- Re-read the full diff against "Why this matters": all seven user actions (add, rename, toggle, delete, filter, clear completed, view) have a passing test, and the Step 5.2 smoke script produced the expected output. If you have a browser, also click through them once; if not, say so in the report — do not claim a click-through you did not do.
+- Re-read the full diff against "Why this matters": all seven user actions (add, rename, mark done/undone, delete, filter, clear completed, view) have a passing test, and the Step 5.2 smoke script produced the expected output. If you have a browser, also click through them once; if not, say so in the report — do not claim a click-through you did not do.
 - Every file traces to a step. Nothing outside the in-scope list (`git status --short` shows only in-scope paths).
 - Files match this plan's content exactly — if you changed anything (an import, a version), say what and why.
-- No `th:utext`, no `.csrf(` call, no `@DynamicPropertySource`, no H2 dependency, no `*IT.java` test names.
+- No `th:utext`, no `.csrf(` call, no `@DynamicPropertySource`, no H2 dependency, no `*IT.java` test names, no `server.address=0.0.0.0`, the allowlist matched exactly with `allowedHosts::contains` (no pattern, prefix or suffix matching), and both `server.request.header.forwarded.strategy=none` and `server.tomcat.remoteip.host-header=` present.
 - No real credentials anywhere (`grep -rn -i password src README.md` shows only the `${DB_PASSWORD:}` placeholder and README prose).
 - Report honestly any verification you skipped or that failed.
 
 **Reviewer: what to scrutinize in this specific change.**
 
 - **Rows 2 and 3 of the falsifiability bar fail with a database exception, not a validation assertion.** That is expected (the DB constraint is the backstop), but confirm the passing tests assert `attributeHasFieldErrors` — i.e. that validation, not the DB, is what rejects the input in the happy path.
-- **`rename` and `toggle` have no explicit `save`.** They depend on `TodoService` being `@Transactional` so dirty checking flushes (bar row 16 proves the tests catch its removal). Check the executor did not add `repository.save(...)` calls "for safety", which would hide that dependency and make row 16 stop failing.
-- **CSRF**: confirm `SecurityConfig` contains no `.csrf(` call and that rows 11 and 12 were actually observed failing. A green suite does not prove CSRF is on — row 11 does.
+- **`rename` and `setCompleted` have no explicit `save`.** They depend on `TodoService` being `@Transactional` so dirty checking flushes (bar row 16 proves the tests catch its removal). Check the executor did not add `repository.save(...)` calls "for safety", which would hide that dependency and make row 16 stop failing.
+- **CSRF + Host allowlist + loopback binding are one control, not three.** Without login, CSRF alone is defeated by DNS rebinding; the allowlist (row 18) is what stops that, and `server.address=127.0.0.1` is what keeps the LAN out. Confirm `SecurityConfig` contains no `.csrf(` call, that rows 11, 12 and 18 were actually observed failing, and that `application.properties` still defaults `SERVER_ADDRESS` to `127.0.0.1` and `ALLOWED_HOSTS` to `localhost,127.0.0.1` (no unit test pins those defaults or the two forwarded-host pins; the smoke script's two `400` lines and the `ss` line are the runtime checks). `server.tomcat.remoteip.host-header=` with an empty value looks like a mistake and is the easiest line to "clean up" — row 22 shows that doing so re-opens the bypass.
 - **Boot 4 package names**: a weaker executor may "fix" a compile error by importing a Boot 3 package. Check that all imports match the ones listed in "Current state".
 - What a green suite would still not catch: a template that renders but is unusable in a real browser (only a manual click-through checks that; the smoke script checks status codes and text), and behaviour against a long-lived production database (only a fresh Flyway `V1` is ever tested).
 
@@ -1094,14 +1249,17 @@ If a row does **not** fail, that is a finding — report it; do not adjust the t
 ALL must hold:
 
 - [ ] `ls -A` shows only `.git .gitattributes .gitignore .mvn README.md mvnw mvnw.cmd plans pom.xml src` (plus `target` after a build, and `.claude` if it was there before)
-- [ ] `./mvnw -B verify` → `Tests run: 19, Failures: 0, Errors: 0, Skipped: 0`, `BUILD SUCCESS`
+- [ ] `./mvnw -B verify` → `Tests run: 22, Failures: 0, Errors: 0, Skipped: 0`, `BUILD SUCCESS`
 - [ ] `./mvnw -B test -Dtest=TodoApplicationTests | grep -c 'generated security password'` → `0`
 - [ ] `grep -rn 'th:utext' src/main/resources/templates` → no output
 - [ ] `grep -rn 'csrf' src/main/java` → no output
 - [ ] `grep -rln 'org.testcontainers.postgresql.PostgreSQLContainer' src/test` → exactly `src/test/java/com/example/todo/TestcontainersConfiguration.java`
 - [ ] `grep -c 'postgres:18-alpine' src/test/java/com/example/todo/TestcontainersConfiguration.java` → `1`
 - [ ] Step 0 preconditions all held
-- [ ] Step 5.2 smoke script printed exactly `1`, `302 http://localhost:8080/todos`, `302 http://localhost:8080/todos?filter=ALL`, `1`, `403`, `1`, `stopped`
+- [ ] Step 5.2 smoke script printed exactly `1`, `1`, `302 http://localhost:8080/todos`, `302 http://localhost:8080/todos?filter=ALL`, `1`, `403`, `1`, `1`, `400`, `400`, `200`, `stopped`
+- [ ] `grep -c '^server.request.header.forwarded.strategy=none$' src/main/resources/application.properties` → `1`
+- [ ] `grep -c '^server.tomcat.remoteip.host-header=$' src/main/resources/application.properties` → `1`, and `grep -c 'remoteip' src/main/resources/application.properties` → `1`
+- [ ] `grep -c 'SERVER_ADDRESS:127.0.0.1' src/main/resources/application.properties` → `1` and `grep -c 'ALLOWED_HOSTS:localhost,127.0.0.1' src/main/resources/application.properties` → `1`
 - [ ] **Every row of the falsifiability bar made to fail, with its observed failure output in the report.** A row that cannot be made to fail FAILS this criterion — report it as a finding
 - [ ] `git status --short` clean after the bar (all mutations reverted)
 - [ ] Code-review self-check completed; outcome in the report
@@ -1123,8 +1281,11 @@ Stop and report back (do not improvise) if:
 ## Maintenance notes
 
 - **Schema changes** go in new migrations (`V2__...sql`, ...). Never edit `V1__create_todo.sql` after it has run against a real database — Flyway's checksum validation will refuse to start the app.
-- **Title length** is defined in three places that must change together: `TodoForm` `@Size(max = 200)`, `Todo` `@Column(length = 200)`, and the migration's `VARCHAR(200)` (plus `maxlength="200"` in both templates). `ddl-auto=validate` does not check column length, so a mismatch is only caught by `titleLongerThan200IsRejected`.
+- **Title length** is defined in three places that must change together: `TodoForm` `@Size(max = 200)`, `Todo` `@Column(length = 200)`, and the migration's `VARCHAR(200)` (plus `maxlength="200"` in both templates). `ddl-auto=validate` does not check column length. `titleLongerThan200IsRejected` catches only a form limit *above* the DB limit; widening the DB column or changing `@Column(length)` alone goes unnoticed by every test.
+- **Exposing the app** (another machine, a hostname, a reverse proxy) is unsupported until authentication exists. Whoever adds it must redesign the network controls together: authentication, `SERVER_ADDRESS`, the allowlist, and — only if a proxy needs it — forwarded headers with `server.tomcat.remoteip.internal-proxies` restricted to that proxy and the proxy overwriting (not appending) `X-Forwarded-Host`. Keep the allowlist an exact match: pattern, prefix or suffix matching re-opens DNS rebinding.
 - **Adding authentication later**: `SecurityConfig` is the single place; replace `permitAll()` with real rules, remove the `spring.autoconfigure.exclude` line from `application.properties`, and add a `todo.owner` column via a new migration. CSRF is already wired.
 - **Adding JavaScript/fetch-based actions later**: those requests must send the CSRF token header, or they will get 403.
+- **Adding any form** fails `everyFormCarriesCsrfToken` until its expected count is raised — deliberately. A GET form (e.g. search) gets no CSRF token by design, so that helper must also be taught to accept `method="get"` forms without a token.
+- **Sessions**: CSRF tokens live in the HTTP session (30-minute idle timeout, lost on restart); an expired page shows `error/403.html`. If that becomes annoying, raise `server.servlet.session.timeout` rather than disabling CSRF.
 - **Postgres image**: bump `postgres:18-alpine` deliberately (and match production's major version); do not use `latest`, which changes under you.
 - `TodoWebTests` does not roll back; it relies on `@BeforeEach repository.deleteAll()`. A new web test class sharing the same Spring context must do the same.
