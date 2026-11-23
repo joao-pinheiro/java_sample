@@ -15,12 +15,13 @@ fully before starting, honor its STOP conditions, and update your row when done.
 - **Not audited**: everything (no code existed).
 - **Verification**: every Boot-4-specific artifact name, import, command output and falsifiability row in plan 001 was measured on a throwaway scratch build (Spring Boot 4.2.0, Testcontainers 2.0.x, postgres:18-alpine, JDK 25) on 2026-11-23: 22 tests green, all 22 falsifiability rows observed failing (rows added after a fresh-context cold read and a premise verifier; the latter added a Host allowlist against DNS rebinding, loopback binding, and idempotent done/undone; later verifier rounds added the forwarded-host pins (server.tomcat.remoteip.host-header empty + forwarded strategy none) and declared any exposure beyond localhost unsupported). Premise review: one cold read plus four premise-verifier rounds; the last two found no BLOCKER/MAJOR in the supported shape (local, loopback, single user). Stamped 2026-11-23.
 - **Merged review**: not run — single plan.
+- **Execution**: plan 001 executed 2026-11-23 by a Sonnet executor in worktree branch `worktree-agent-af4805d130c3090f6` (5 commits, `499d39a`..`c47b2ad`). Reviewer re-ran all done criteria (22/22 tests, greps, smoke script exact) and audited the executor's falsifiability report (22/22 rows failing). Verdict APPROVE.
 
 ## Execution order & status
 
 | Plan | Title | Priority | Effort | Depends on | Status | Issue |
 |------|-------|----------|--------|------------|--------|-------|
-| 001  | Build a single-user todo web app on Spring Boot 4.2, PostgreSQL and Thymeleaf, tested via Testcontainers | P1 | M | — | TODO | — |
+| 001  | Build a single-user todo web app on Spring Boot 4.2, PostgreSQL and Thymeleaf, tested via Testcontainers | P1 | M | — | DONE — `worktree-agent-af4805d130c3090f6` @ `c47b2ad`, merged `7aede0f` | — |
 
 ## Dependency notes
 
