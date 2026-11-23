@@ -1041,3 +1041,271 @@ The file isn't committed. If it is, it ends up in the public repo, so say if you
 
 also remove local paths; commit to the repo
 
+
+> *Tool: Bash — Redact local paths and regenerate transcript*
+
+
+> *Tool: Bash — Check residual identifiers and commit transcript*
+
+
+## Claude (2026-11-23 15:42:45)
+
+I committed the transcript as `b6d71bd` "Add session transcript", with local paths stripped:
+
+- Project paths are now `<repo>`.
+- Temp and scratch paths are now `<scratchpad>` / `<tmp>`.
+- Your home directory is now `~`.
+
+No `/home/...` or `/tmp/claude...` paths remain. A few generic `~/.m2` references from the reviewers' reports are still there.
+
+The commit isn't pushed. Say if you want it on GitHub. The uncommitted `plans/README.md` change is the `IN PROGRESS` status for the running executor. I left it out of the commit, along with the untracked `.claude/` folder.
+
+
+### Subagent report (2026-11-23 15:49:35)
+
+STATUS: COMPLETE
+
+STEPS:
+- Step 0: done. Java 25.0.5.1, Docker 29.9.3, `docker pull -q postgres:18-alpine` OK, git repo true, git identity set, `ss` present, port 8080 curl rc=7. HEAD was `fefd90f` on branch worktree-agent-af4805d130c3090f6; I stayed on it (no checkout remedy needed). `ls -A` showed only `.git` and `plans`.
+- Step 1: done. The Initializr curl exited 0. Edit 1 removed thymeleaf-extras-springsecurity6. Edit 2 overwrote TestcontainersConfiguration.java. The generated file already imported `org.testcontainers.postgresql.PostgreSQLContainer`. Checks: parent count 1, `4.2.0` count 1, extras count 0, artifact list is exactly the 20 expected lines. `./mvnw -B test` gave `Tests run: 1, Failures: 0, Errors: 0, Skipped: 0` and BUILD SUCCESS. Committed.
+- Step 2: done. TodoRepositoryTests ran 3 tests, 0 failures, BUILD SUCCESS. TodoApplicationTests ran 1 test, 0 failures, BUILD SUCCESS. The output of that second run contained no "generated security password" line, so the count is 0. Committed.
+- Step 3: done. TodoWebTests ran `Tests run: 18, Failures: 0, Errors: 0, Skipped: 0`, BUILD SUCCESS. No `th:utext` output. `<form` count 4 and `<form th:action=` count 4 in list.html. `grep csrf src/main/java` gave no output. Committed.
+- Step 4: done. The first README had a grep count of 6, below the required 7. The count is per line and my prose had `SERVER_ADDRESS` and `ALLOWED_HOSTS` on one line, so I split them into two lines. The count is now 7. That fix is a separate commit, "Split README env var lines".
+- Step 5.1: `./mvnw -B verify` gave `Tests run: 22, Failures: 0, Errors: 0, Skipped: 0`, BUILD SUCCESS.
+- Step 5.2: smoke script run verbatim (saved outside the repo, in the scratchpad). Output was `1|1|302 http://localhost:8080/todos|302 http://localhost:8080/todos?filter=ALL|1|403|1|1|400|400|200|stopped`, exactly as expected.
+- Step 5.3: falsifiability bar, see below. All 22 rows failed as expected.
+- `plans/README.md`: skipped as instructed.
+
+STOPPED BECAUSE: n/a
+
+FILES CHANGED (all in scope, none modified outside it): pom.xml, mvnw, mvnw.cmd, .mvn/wrapper/maven-wrapper.properties, .gitignore, .gitattributes, README.md, src/main/java/com/example/todo/{TodoApplication,Todo,TodoRepository,TodoFilter,TodoNotFoundException,TodoService,TodoForm,TodoController,SecurityConfig}.java, src/main/resources/application.properties, src/main/resources/db/migration/V1__create_todo.sql, src/main/resources/templates/todos/{list,edit}.html, src/main/resources/templates/error/{404,403}.html, src/test/java/com/example/todo/{TestTodoApplication,TodoApplicationTests,TestcontainersConfiguration,TodoRepositoryTests,TodoWebTests}.java. `target/` is gitignored.
+
+SELF-REVIEW:
+- Seven user actions: each has a passing test in TodoWebTests (create, rename, done/undone, delete, filter, clear completed, list/view), and the smoke script printed the expected output. No browser click-through was done; I do not claim one.
+- Scope: `git status --short` printed nothing after the bar (clean tree). Every file traces to a step. The extra "Split README env var lines" commit is the only addition beyond the plan's commit list.
+- Content matches the plan exactly, apart from three small points:
+  - The pom.xml has one leftover blank line where Edit 1 removed the block.
+  - My README prose is my own wording; the commands match the plan.
+  - The generated `mvnw.cmd` triggered a git LF/CRLF warning on `git add`.
+- Forbidden-content greps all came back clean:
+  - No `th:utext` and no `csrf` in src/main/java.
+  - No `DynamicPropertySource`, no h2database, no `0.0.0.0`, no `*IT.java`.
+  - `allowedHosts::contains` is in use.
+  - application.properties has the `server.request.header.forwarded.strategy=none` line (count 1) and the `server.tomcat.remoteip.host-header=` line (count 1). `remoteip` appears once in the file.
+  - `SERVER_ADDRESS:127.0.0.1` and `ALLOWED_HOSTS:localhost,127.0.0.1` each appear once.
+  - Done criteria: the only `PostgreSQLContainer` file under src/test is TestcontainersConfiguration.java, and `postgres:18-alpine` appears once in it.
+- Credentials: `grep -i password` shows only `${DB_PASSWORD:}`, the `.withPassword(UUID.randomUUID().toString())` line, and README prose.
+- Skipped or failed verification: none left outstanding. Two bar rows had a transient problem on the first run; see the bar notes.
+
+TESTS: All plan cases are covered as written. 3 repository tests (@DataJpaTest on Testcontainers Postgres 18), 1 context test (generated `contextLoads`), and 18 web tests (@SpringBootTest + MockMvc + real Postgres). Total 22, all passing in `./mvnw -B verify`. No H2, no mocks. This is a greenfield build, not a bug fix.
+
+FALSIFIABILITY BAR (mutation applied, test run, `git checkout` restore, `git diff --exit-code` clean after every row):
+1. list.html `th:utext`: `TodoWebTests.titleIsHtmlEscaped:217 Response content`.
+2. Removed `@Valid` in `create`: `blankTitleIsRejectedAndNothingSaved:61 » Servlet ... DataIntegrityViolationException ... violates check constraint "tod..."` (as expected, a DB error rather than an assertion).
+3. Removed `@Size`: `titleLongerThan200IsRejected:70 » Servlet ... DataIntegrityViolationException ... value too long for type character varying(200)`.
+4. `new Todo(title)`: `createThenListShowsTodo:51` (assertion).
+5. Toggle in `setCompleted`: `completedSetsTheRequestedStateIdempotently:82` (assertion). The first pass reported "Failed to load ApplicationContext" instead. I re-ran the row alone and it failed with the assertion above, so that first error looks transient (not diagnosed).
+6. ACTIVE returns all: `filterShowsOnlyMatchingTodos:121 Response content`.
+7. Delete-all query: `TodoWebTests.clearCompletedKeepsActive:143` and `TodoRepositoryTests.deleteCompletedRemovesOnlyCompleted:45`, both assertions.
+8. Removed `@ResponseStatus`: `unknownIdReturns404:169 » Servlet Request processing failed: com.example.todo.TodoNotFoundException: Todo 999999 not found`.
+9. Removed CHECK: `TodoRepositoryTests.databaseRejectsBlankTitle:51` (assertion, no exception thrown). The first pass also reported "Failed to load ApplicationContext" here; the re-run, alone, gave the assertion above. A separate standalone run during diagnosis also gave a plain assertion failure.
+10. `redirectTo` without filter: `completedSetsTheRequestedStateIdempotently:81 Redirected URL expected:</todos?filter=ACTIVE> but was:</todos>`.
+11. Added `.csrf(disable)`: `postWithoutCsrfTokenIsRejected:183 Status expected:<403> but was:<302>`.
+12. Plain `action=` on the clear-completed form: `everyFormCarriesCsrfToken:190->assertEveryFormHasCsrfToken:199` (assertion).
+13. `count()` instead of `countByCompleted`: `filterShowsOnlyMatchingTodos:119 Response content`.
+14. rename without `strip`: `editRenamesTodo:154` (assertion).
+15. `deleteAll` instead of `delete(get(id))`: `deleteRemovesTodo:133` (assertion).
+16. Removed class-level `@Transactional`: `completedSetsTheRequestedStateIdempotently:82` and `editRenamesTodo:154`, both assertions.
+17. `th:value` without `!`: `completedFormOffersTheOppositeState:92 Response content`.
+18. Removed `setAllowedHostnames`: `requestWithForeignHostHeaderIsRejected:206 Status expected:<400> but was:<200>`.
+19. `"localhost"::equals`: `requestWithForeignHostHeaderIsRejected:209 Status expected:<200> but was:<400>`.
+20. Dropped `filter=` from the completed form action: `listFormsPreserveTheCurrentFilter:107 Response content`.
+21. Suffix matching: `requestWithForeignHostHeaderIsRejected:206 Status expected:<400> but was:<200>`.
+22. Deleted `server.tomcat.remoteip.host-header=`: the smoke script printed `1|1|302 ...|302 ...?filter=ALL|1|403|1|1|400|200|200|stopped`. The tenth line is `200` instead of `400`, as expected. Restored, `git diff --exit-code` clean.
+No row failed to fail.
+
+NOTES:
+- Plan 001's commands for rows 1-21 were run via a scratchpad driver script. It does exact single-occurrence text replacement and aborts if the old text is not found exactly once; none aborted.
+- The plan's README verify grep counts lines, so the SERVER_ADDRESS/ALLOWED_HOSTS split was a prose-layout fix, not a content change.
+- Nothing was pushed.
+- Worktree: <repo>/.claude/worktrees/agent-af4805d130c3090f6
+- Branch: worktree-agent-af4805d130c3090f6
+- Final commit: c47b2ad (commits: 499d39a skeleton, ac59ded persistence, 3067c71 UI, ef9dd86 README, c47b2ad README split)
+
+
+## Claude (2026-11-23 15:49:42)
+
+The executor reports all steps complete and all 22 falsifiability rows failing as intended. I'm verifying that instead of taking its word for it. First, scope, and a byte comparison of every file against the plan's content (the plan's inlined files came straight from the scratch build):
+
+
+> *Tool: Bash — Check executor scope and compare files to plan content*
+
+
+> *Tool: Bash — Check for leftover executor processes or containers*
+
+
+## Claude (2026-11-23 15:49:57)
+
+Nothing of the executor's is still running: port 8080 is free, and the running containers belong to something else (none are `postgres:18-alpine`). Re-running the done criteria in the worktree:
+
+
+> *Tool: Bash — Re-run plan 001 done criteria in worktree*
+
+
+## Claude (2026-11-23 15:51:01)
+
+All of those pass. Now running the plan's Step 5.2 smoke script, taken verbatim from the plan, and reading the README the executor wrote:
+
+
+> *Tool: Bash — Run plan smoke script in worktree and show README*
+
+
+## Claude (2026-11-23 15:51:31)
+
+The smoke script printed exactly the expected 12 lines, and the README covers every point the plan requires. Recording the verdict in the index (main checkout):
+
+
+> *Tool: Bash — Mark plan 001 DONE in the index*
+
+
+## Claude (2026-11-23 15:51:44)
+
+**Verdict: APPROVE.** Plan 001 is built on branch `worktree-agent-af4805d130c3090f6`, five commits ending at `c47b2ad`. It isn't merged into `master` yet.
+
+I re-ran the checks in the worktree rather than relying on the executor's report:
+
+- **Tests:** 22 pass in a full `./mvnw -B verify`.
+- **Plan's checks:** every grep in the done criteria passes, including the security settings (Host allowlist, loopback binding, both forwarded-header pins, CSRF not disabled).
+- **Smoke test:** the plan's dev-run script printed exactly the 12 expected lines. That covers loopback binding, adding a todo with a CSRF token, a 403 without one, a 404 page, and rejecting a forged `Host` or `X-Forwarded-Host`.
+- **Scope:** every file is byte-identical to the plan's code, except `pom.xml` (dependency order as Initializr generated it) and the README, which has the executor's own wording.
+- **Mutation checks:** the executor reported failure output for all 22. Two failed on the first try with a context-load error before failing for the stated reason on a re-run. That looks transient, but it wasn't diagnosed.
+
+The executor made one small deviation, documented in its report: it split two env-var lines in the README so the plan's line-count check would pass. Nobody clicked through the app in a real browser; only the scripted checks above cover the UI.
+
+I marked plan 001 `DONE` in `plans/README.md`. That change isn't committed. To merge: `git merge worktree-agent-af4805d130c3090f6` on `master`. The worktree is still at `.claude/worktrees/agent-af4805d130c3090f6` if you want to look first.
+
+
+### Subagent report (2026-11-23 15:57:01)
+
+STATUS: COMPLETE
+
+STEPS:
+- Step 0: done. Java 25.0.5.1, Docker 29.9.3, docker pull of postgres:18-alpine OK, git repo true, git identity set, `ss` present, port 8080 curl rc=7. HEAD was fefd90f on branch worktree-agent-af4805d130c3090f6; I stayed on it. `ls -A` showed only `.git` and `plans`.
+- Step 1: done. Initializr curl exited 0. Edit 1 removed thymeleaf-extras-springsecurity6; Edit 2 overwrote TestcontainersConfiguration.java (the generated file already imported org.testcontainers.postgresql.PostgreSQLContainer). Checks: parent count 1, `4.2.0` count 1, extras count 0, artifact list is exactly the 20 expected lines. `./mvnw -B test` gave Tests run: 1, Failures: 0, Errors: 0, Skipped: 0 and BUILD SUCCESS. Committed.
+- Step 2: done. TodoRepositoryTests ran 3 tests, 0 failures, BUILD SUCCESS. TodoApplicationTests ran 1 test, 0 failures, BUILD SUCCESS. That run's output had no "generated security password" line, so the count is 0. Committed.
+- Step 3: done. TodoWebTests ran Tests run: 18, Failures: 0, Errors: 0, Skipped: 0, BUILD SUCCESS. No `th:utext` output. `<form` count 4 and `<form th:action=` count 4 in list.html. `grep csrf src/main/java` gave no output. Committed.
+- Step 4: done. The first README had a grep count of 6, below the required 7. The count is per line and my prose had SERVER_ADDRESS and ALLOWED_HOSTS on one line, so I split them into two lines. The count is now 7. That fix is a separate commit, "Split README env var lines".
+- Step 5.1: `./mvnw -B verify` gave Tests run: 22, Failures: 0, Errors: 0, Skipped: 0, BUILD SUCCESS.
+- Step 5.2: smoke script run verbatim (saved outside the repo, in the scratchpad). Output was `1|1|302 http://localhost:8080/todos|302 http://localhost:8080/todos?filter=ALL|1|403|1|1|400|400|200|stopped`, exactly as expected.
+- Step 5.3: falsifiability bar, see below. All 22 rows failed as expected.
+- plans/README.md: skipped as instructed.
+
+STOPPED BECAUSE: n/a
+
+FILES CHANGED (all in scope, none modified outside it): pom.xml, mvnw, mvnw.cmd, .mvn/wrapper/maven-wrapper.properties, .gitignore, .gitattributes, README.md, src/main/java/com/example/todo/{TodoApplication,Todo,TodoRepository,TodoFilter,TodoNotFoundException,TodoService,TodoForm,TodoController,SecurityConfig}.java, src/main/resources/application.properties, src/main/resources/db/migration/V1__create_todo.sql, src/main/resources/templates/todos/{list,edit}.html, src/main/resources/templates/error/{404,403}.html, src/test/java/com/example/todo/{TestTodoApplication,TodoApplicationTests,TestcontainersConfiguration,TodoRepositoryTests,TodoWebTests}.java. `target/` is gitignored.
+
+SELF-REVIEW:
+- Seven user actions: each has a passing test in TodoWebTests (create, rename, done/undone, delete, filter, clear completed, list/view), and the smoke script printed the expected output. No browser click-through was done; I do not claim one.
+- Scope: `git status --short` printed nothing after the bar (clean tree). Every file traces to a step. The extra "Split README env var lines" commit is the only addition beyond the plan's commit list.
+- Content matches the plan exactly, apart from three small points: the pom.xml has one leftover blank line where Edit 1 removed the block; my README prose is my own wording (commands match the plan); and `git add` printed an LF/CRLF warning for the generated mvnw.cmd.
+- Forbidden-content greps all came back clean:
+  - No th:utext and no csrf in src/main/java.
+  - No DynamicPropertySource, no h2database, no 0.0.0.0, no *IT.java.
+  - `allowedHosts::contains` is in use.
+  - application.properties has the forwarded.strategy=none line (count 1) and the host-header= line (count 1), and `remoteip` appears once in the file.
+  - `SERVER_ADDRESS:127.0.0.1` and `ALLOWED_HOSTS:localhost,127.0.0.1` each appear once.
+  - Done criteria: the only PostgreSQLContainer file under src/test is TestcontainersConfiguration.java, and `postgres:18-alpine` appears once in it.
+- Credentials: `grep -i password` shows only `${DB_PASSWORD:}`, the `.withPassword(UUID.randomUUID().toString())` line, and README prose.
+- Skipped or failed verification: none left outstanding. Two bar rows (5 and 9) had a transient problem on the first run; see the bar notes.
+
+TESTS: All plan cases are covered as written. 3 repository tests (@DataJpaTest on Testcontainers Postgres 18), 1 context test (generated contextLoads), and 18 web tests (@SpringBootTest + MockMvc + real Postgres). Total 22, all passing in `./mvnw -B verify`. No H2, no mocks. This is a greenfield build, not a bug fix.
+
+FALSIFIABILITY BAR (mutation applied, test run, git checkout restore, `git diff --exit-code` clean after every row):
+1. list.html th:utext: TodoWebTests.titleIsHtmlEscaped:217 Response content.
+2. Removed @Valid in create: blankTitleIsRejectedAndNothingSaved:61 » Servlet ... DataIntegrityViolationException ... violates check constraint "tod..." (a DB error rather than an assertion, as the plan expects).
+3. Removed @Size: titleLongerThan200IsRejected:70 » Servlet ... DataIntegrityViolationException ... value too long for type character varying(200).
+4. new Todo(title): createThenListShowsTodo:51 (assertion).
+5. Toggle in setCompleted: completedSetsTheRequestedStateIdempotently:82 (assertion). The first pass reported "Failed to load ApplicationContext" instead; I re-ran the row alone and it failed with the assertion, so the first error looks transient (not diagnosed).
+6. ACTIVE returns all: filterShowsOnlyMatchingTodos:121 Response content.
+7. Delete-all query: TodoWebTests.clearCompletedKeepsActive:143 and TodoRepositoryTests.deleteCompletedRemovesOnlyCompleted:45, both assertions.
+8. Removed @ResponseStatus: unknownIdReturns404:169 » Servlet Request processing failed: com.example.todo.TodoNotFoundException: Todo 999999 not found.
+9. Removed CHECK: TodoRepositoryTests.databaseRejectsBlankTitle:51 (assertion, no exception thrown). The first pass also reported "Failed to load ApplicationContext" here; a re-run alone gave the assertion, and a separate diagnostic run also failed with a plain assertion failure.
+10. redirectTo without filter: completedSetsTheRequestedStateIdempotently:81 Redirected URL expected:</todos?filter=ACTIVE> but was:</todos>.
+11. Added .csrf(disable): postWithoutCsrfTokenIsRejected:183 Status expected:<403> but was:<302>.
+12. Plain action= on the clear-completed form: everyFormCarriesCsrfToken:190->assertEveryFormHasCsrfToken:199 (assertion).
+13. count() instead of countByCompleted: filterShowsOnlyMatchingTodos:119 Response content.
+14. rename without strip: editRenamesTodo:154 (assertion).
+15. deleteAll instead of delete(get(id)): deleteRemovesTodo:133 (assertion).
+16. Removed class-level @Transactional: completedSetsTheRequestedStateIdempotently:82 and editRenamesTodo:154, both assertions.
+17. th:value without !: completedFormOffersTheOppositeState:92 Response content.
+18. Removed setAllowedHostnames: requestWithForeignHostHeaderIsRejected:206 Status expected:<400> but was:<200>.
+19. "localhost"::equals: requestWithForeignHostHeaderIsRejected:209 Status expected:<200> but was:<400>.
+20. Dropped filter= from the completed form action: listFormsPreserveTheCurrentFilter:107 Response content.
+21. Suffix matching: requestWithForeignHostHeaderIsRejected:206 Status expected:<400> but was:<200>.
+22. Deleted server.tomcat.remoteip.host-header=: smoke script printed `1|1|302 ...|302 ...?filter=ALL|1|403|1|1|400|200|200|stopped`. The tenth line is 200 instead of 400, as expected. Restored, `git diff --exit-code` clean.
+No row failed to fail.
+
+NOTES:
+- Rows 1-21 were run through a scratchpad driver script that does exact single-occurrence text replacement and aborts if the old text is not found exactly once; none aborted.
+- The plan's README verify grep counts lines, so the SERVER_ADDRESS/ALLOWED_HOSTS split was a prose-layout fix, not a content change.
+- Nothing was pushed.
+- Worktree: <repo>/.claude/worktrees/agent-af4805d130c3090f6
+- Branch: worktree-agent-af4805d130c3090f6
+- Final commit: c47b2ad (commits: 499d39a skeleton, ac59ded persistence, 3067c71 UI, ef9dd86 README, c47b2ad README split)
+
+
+## Claude (2026-11-23 15:57:04)
+
+That's a repeat of the executor's earlier report with nothing new, so my verdict doesn't change. Plan 001 is approved and still unmerged, on branch `worktree-agent-af4805d130c3090f6` at `c47b2ad`. Merging it into `master` is your call.
+
+
+## Claude (2026-11-23 15:57:08)
+
+The executor has finished; this notice adds nothing new. Plan 001 is approved and waiting for you to merge it from `worktree-agent-af4805d130c3090f6` (`c47b2ad`).
+
+
+---
+
+## User (2026-11-23 16:30:58)
+
+merge it, commit and push
+
+
+> *Tool: Bash — Merge executor branch into master*
+
+
+> *Tool: Bash — Record merge in index, commit, push*
+
+
+## Claude (2026-11-23 16:31:24)
+
+I merged plan 001 into `master` and pushed to GitHub:
+
+- `7aede0f` is the merge commit with the executor's work.
+- `725a462` marks plan 001 as merged in `plans/README.md`.
+
+The pushed history also includes the transcript commit (`b6d71bd`), which hadn't been pushed before.
+
+The executor's worktree is still at `.claude/worktrees/agent-af4805d130c3090f6`, and `.claude/` is still untracked. Should I remove the worktree and add `.claude/` to `.gitignore`?
+
+
+---
+
+## User (2026-11-23 16:32:04)
+
+yes, remove it and update .gitignore, commit and push
+
+
+> *Tool: Bash — Remove executor worktree and merged branch*
+
+
+## Claude (2026-11-23 16:32:14)
+
+The worktree is locked by the executor agent's process ID. Checking whether that process is still alive before unlocking it:
+
+
+> *Tool: Bash — Check if the locking agent process is alive*
+
+
+> *Tool: Bash — Unlock and remove worktree, delete merged branch*
+
