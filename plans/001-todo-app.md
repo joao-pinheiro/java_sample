@@ -22,7 +22,7 @@
 - **Depends on**: none
 - **Category**: direction
 - **Planned at**: no commit — `/home/jpinheiro/blackshield/sample_project` was an empty directory and not a git repository, 2026-11-23
-- **Premise verified**: pending
+- **Premise verified**: 2026-11-23, by coding:review-plan
 
 ## Why this matters
 
@@ -51,7 +51,7 @@ requests whose `Host` header is on an allowlist** (default `localhost`,
 
 ## Current state
 
-- The repository root contains only `plans/` (this file and `plans/README.md`).
+- The repository root contains only `plans/` (this file and `plans/README.md`). If `plans/` also holds another file (e.g. a `.pdf` export of an earlier draft), ignore it: it is outdated, and this `.md` file is the only authoritative plan.
   No code, no build file.
 - Toolchain observed on the planning machine on 2026-11-23:
   - JDK: `openjdk version "25.0.5.1"` (Java 25, an LTS release) — the project targets Java 25.
@@ -90,8 +90,8 @@ requests whose `Host` header is on an allowlist** (default `localhost`,
     default loopback **and** all private ranges (10/8, 172.16/12, 192.168/16, …).
     A DNS-rebinding page on the same machine can set that header. The valve is
     installed when forwarded headers are on (explicitly, or automatically when
-    Boot detects a cloud platform) **or** when any `server.tomcat.remoteip.*`
-    header property is set. Two pins in `application.properties` close this:
+    Boot detects a cloud platform) **or** when `server.tomcat.remoteip.protocol-header`
+    or `server.tomcat.remoteip.remote-ip-header` is set. Two pins in `application.properties` close this:
     - `server.tomcat.remoteip.host-header=` (empty) — even if the valve is
       installed, it never takes the host from a header. This is the load-bearing pin.
     - `server.request.header.forwarded.strategy=none` — Boot never installs
@@ -990,7 +990,7 @@ class TodoWebTests {
 		Todo done = repository.save(new Todo("drop"));
 		mvc.perform(post("/todos/{id}/completed", done.getId()).param("completed", "true").with(csrf()));
 
-		mvc.perform(post("/todos/clear-completed").param("filter", "COMPLETED").with(csrf())).andExpect(redirectedUrl("/todos?filter=COMPLETED"));
+		mvc.perform(post("/todos/clear-completed").param("filter", "ACTIVE").with(csrf())).andExpect(redirectedUrl("/todos?filter=ACTIVE"));
 		assertThat(repository.findAll()).extracting(Todo::getTitle).containsExactly("keep");
 	}
 
@@ -1047,13 +1047,13 @@ class TodoWebTests {
 		assertThat(parts.length - 1).isEqualTo(expectedForms);
 		for (int i = 1; i < parts.length; i++) {
 			String form = parts[i].substring(0, parts[i].toLowerCase().indexOf("</form>"));
-			assertThat(form).contains("method=\"post\"").contains("type=\"hidden\" name=\"_csrf\"");
+			assertThat(form).contains("method=\"post\"").containsPattern("type=\"hidden\" name=\"_csrf\" value=\"[^\"]+\"");
 		}
 	}
 
 	@Test
 	void requestWithForeignHostHeaderIsRejected() throws Exception {
-		for (String host : new String[] { "evil.example", "localhostx", "ost", "127.0.0.2", "evillocalhost", "127x0x0x1" }) {
+		for (String host : new String[] { "evil.example", "localhostx", "ost", "127.0.0.2", "evillocalhost", "127x0x0x1", "127.1", "localhost." }) {
 			mvc.perform(get("/todos").header("Host", host)).andExpect(status().isBadRequest());
 		}
 		for (String host : new String[] { "localhost:8080", "127.0.0.1", "127.0.0.1:8080" }) {
@@ -1089,7 +1089,7 @@ Create `README.md` with these sections (prose is yours, the commands must be exa
 - **Run against your own PostgreSQL**: set `DB_URL` (default `jdbc:postgresql://localhost:5432/todo`), `DB_USERNAME` (default `todo`), `DB_PASSWORD`, then `./mvnw spring-boot:run`. Flyway creates the schema on startup.
 - **Your own PostgreSQL — requirements**: the database and the `DB_USERNAME` role must already exist (Flyway does not create them); use a dedicated, **empty** database owned by `DB_USERNAME` (PostgreSQL 15+ no longer lets non-owners create tables in `public`; Flyway refuses a non-empty schema that has no Flyway history table). Do not "fix" that with `spring.flyway.baseline-on-migrate=true`: with the default baseline version `1` it skips `V1` and startup then fails schema validation.
 - **Package**: `./mvnw package` (runs the tests, so Docker is needed; add `-DskipTests` to skip them), then `java -jar target/todo-0.0.1-SNAPSHOT.jar` with the same `DB_*` variables. Requires a Java 25 runtime.
-- **Network and security**: this is a **local, single-user app with no login**. It listens on `127.0.0.1` only (open http://127.0.0.1:8080 if `localhost` resolves only to `::1` on your machine) and answers only requests whose `Host` is `localhost` or `127.0.0.1`; CSRF protection is on. The Host allowlist protects your browser against DNS rebinding; it is **not access control** — any program that can connect can send `Host: localhost`. Running it anywhere else — on another machine, on `0.0.0.0`, behind a reverse proxy — is **unsupported**: anyone who can reach it can read and change the list. That needs authentication first, which this app does not have. Do not set any `server.tomcat.remoteip.*` or `server.request.header.forwarded.*` property: they let `X-Forwarded-Host` bypass the allowlist. `SERVER_ADDRESS` and `ALLOWED_HOSTS` (comma-separated hostnames without port; an empty value rejects every request) exist for development only.
+- **Network and security**: this is a **local, single-user app with no login**. It listens on `127.0.0.1` only (open http://127.0.0.1:8080 if `localhost` resolves only to `::1` on your machine) and answers only requests whose `Host` is `localhost` or `127.0.0.1`; CSRF protection is on. The Host allowlist protects your browser against DNS rebinding; it is **not access control** — any program that can connect can send `Host: localhost`. Running it anywhere else — on another machine, on `0.0.0.0`, behind a reverse proxy — is **unsupported**: anyone who can reach it can read and change the list. That needs authentication first, which this app does not have. Do not add, change or remove any `server.tomcat.remoteip.*` or `server.request.header.forwarded.*` property: the two already in `application.properties` (`server.request.header.forwarded.strategy=none` and the deliberately empty `server.tomcat.remoteip.host-header=`) are required security settings, and any other value lets `X-Forwarded-Host` bypass the allowlist. `SERVER_ADDRESS` and `ALLOWED_HOSTS` (comma-separated hostnames without port; an empty value rejects every request) exist for development only.
 - **Testcontainers**: needs a Docker-compatible daemon found via `DOCKER_HOST` or the default socket; Docker CLI contexts are not read. For Podman, point `DOCKER_HOST` at the Podman socket. Docker publishes container ports on all network interfaces, including the PostgreSQL and Testcontainers' Ryuk containers during `spring-boot:test-run`; on an untrusted network set `"ip": "127.0.0.1"` in Docker's `daemon.json`.
 
 **Verify**: `grep -c -e './mvnw verify' -e './mvnw spring-boot:test-run' -e 'DB_URL' -e 'ALLOWED_HOSTS' -e 'SERVER_ADDRESS' -e 'DOCKER_HOST' -e 'DskipTests' README.md` → `7` or more.
@@ -1161,14 +1161,14 @@ the repository or service**. Two layers:
   - `completedFormOffersTheOppositeState` — an open todo's form carries `completed=true` and no `false`; once completed, the reverse.
   - `filterShowsOnlyMatchingTodos` — ACTIVE and COMPLETED views exclude the other kind; the active counter reads `1 item(s) left` with one open and one completed todo.
   - `deleteRemovesTodo` — with two todos, only the targeted one is removed; redirect preserves `filter=COMPLETED`.
-  - `clearCompletedKeepsActive` — redirect keeps `filter=COMPLETED`.
+  - `clearCompletedKeepsActive` — posted from the `ACTIVE` view, it still deletes only completed todos (rules out "delete what the current filter shows"); redirect keeps `filter=ACTIVE`.
   - `editRenamesTodo` — edit form is pre-filled; rename persists, trimmed (`"  new  "` → `new`).
   - `editWithBlankTitleKeepsOldTitle`
   - `unknownIdReturns404` — edit, set-completed and delete on a missing id.
   - `invalidFilterReturns400` — HTTP 400 caused specifically by `MethodArgumentTypeMismatchException` (enum conversion), not any 400.
   - `postWithoutCsrfTokenIsRejected` — HTTP 403 and nothing saved.
-  - `everyFormCarriesCsrfToken` — the list page (one todo) has exactly 4 forms and the edit page 1 (`<form` matched case-insensitively), and **each** form, up to its `</form>`, contains `method="post"` and its own hidden `_csrf` input.
-  - `requestWithForeignHostHeaderIsRejected` — `evil.example`, `localhostx`, `ost`, `127.0.0.2`, `evillocalhost`, `127x0x0x1` → 400 (rules out substring, prefix, suffix, regex and deny-list implementations); `localhost:8080`, `127.0.0.1`, `127.0.0.1:8080` → 200 (rules out an implementation that ignores the property's second entry).
+  - `everyFormCarriesCsrfToken` — the list page (one todo) has exactly 4 forms and the edit page 1 (`<form` matched case-insensitively), and **each** form, up to its `</form>`, contains `method="post"` and its own hidden `_csrf` input with a non-empty value.
+  - `requestWithForeignHostHeaderIsRejected` — `evil.example`, `localhostx`, `ost`, `127.0.0.2`, `evillocalhost`, `127x0x0x1`, `127.1`, `localhost.` → 400 (rules out substring, prefix, suffix, regex, DNS-resolution-based and deny-list implementations); `localhost:8080`, `127.0.0.1`, `127.0.0.1:8080` → 200 (rules out an implementation that ignores the property's second entry).
   - `listFormsPreserveTheCurrentFilter` — on `?filter=ACTIVE`, the add, done/undone, delete and clear-completed form actions all carry `?filter=ACTIVE`.
   - `titleIsHtmlEscaped` — `<script>` in a title is rendered escaped.
 
@@ -1233,7 +1233,7 @@ The `server.request.header.forwarded.strategy=none` pin has **no row of its own*
 - Every file traces to a step. Nothing outside the in-scope list (`git status --short` shows only in-scope paths).
 - Files match this plan's content exactly — if you changed anything (an import, a version), say what and why.
 - No `th:utext`, no `.csrf(` call, no `@DynamicPropertySource`, no H2 dependency, no `*IT.java` test names, no `server.address=0.0.0.0`, the allowlist matched exactly with `allowedHosts::contains` (no pattern, prefix or suffix matching), and both `server.request.header.forwarded.strategy=none` and `server.tomcat.remoteip.host-header=` present.
-- No real credentials anywhere (`grep -rn -i password src README.md` shows only the `${DB_PASSWORD:}` placeholder and README prose).
+- No real credentials anywhere (`grep -rn -i password src README.md` shows only the `${DB_PASSWORD:}` placeholder, the `.withPassword(UUID.randomUUID().toString())` line in `TestcontainersConfiguration.java`, and README prose).
 - Report honestly any verification you skipped or that failed.
 
 **Reviewer: what to scrutinize in this specific change.**
@@ -1242,6 +1242,8 @@ The `server.request.header.forwarded.strategy=none` pin has **no row of its own*
 - **`rename` and `setCompleted` have no explicit `save`.** They depend on `TodoService` being `@Transactional` so dirty checking flushes (bar row 16 proves the tests catch its removal). Check the executor did not add `repository.save(...)` calls "for safety", which would hide that dependency and make row 16 stop failing.
 - **CSRF + Host allowlist + loopback binding are one control, not three.** Without login, CSRF alone is defeated by DNS rebinding; the allowlist (row 18) is what stops that, and `server.address=127.0.0.1` is what keeps the LAN out. Confirm `SecurityConfig` contains no `.csrf(` call, that rows 11, 12 and 18 were actually observed failing, and that `application.properties` still defaults `SERVER_ADDRESS` to `127.0.0.1` and `ALLOWED_HOSTS` to `localhost,127.0.0.1` (no unit test pins those defaults or the two forwarded-host pins; the smoke script's two `400` lines and the `ss` line are the runtime checks). `server.tomcat.remoteip.host-header=` with an empty value looks like a mistake and is the easiest line to "clean up" — row 22 shows that doing so re-opens the bypass.
 - **Boot 4 package names**: a weaker executor may "fix" a compile error by importing a Boot 3 package. Check that all imports match the ones listed in "Current state".
+- **The smoke script's launch line must keep `SERVER_TOMCAT_REMOTEIP_PROTOCOLHEADER`** (or `..._REMOTEIPHEADER`): only those two `server.tomcat.remoteip.*` settings make Tomcat install the RemoteIpValve. Swapping in any other remoteip variable would make the tenth line print `400` without exercising the pins at all.
+- **Some "rules out" claims in the test plan were measured on the planning build but have no falsifiability row**: DNS-resolution-based and substring/prefix/regex allowlists (only suffix matching has a row, 21), and a clear-completed that deletes "what the current filter shows". If the executor's report shows the Host or clear-completed tests changed from the plan's text, re-check those claims by hand.
 - What a green suite would still not catch: a template that renders but is unusable in a real browser (only a manual click-through checks that; the smoke script checks status codes and text), and behaviour against a long-lived production database (only a fresh Flyway `V1` is ever tested).
 
 ## Done criteria
